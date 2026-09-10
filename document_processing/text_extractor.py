@@ -1,47 +1,102 @@
 from __future__ import annotations
 
 import io
-import re
 from typing import Any, Dict, List
 
 from pypdf import PdfReader
 
 
-class PDFTextExtractor:
-    """Extract text page by page while preserving page numbers for evidence tracking."""
+class TextExtractor:
+    """
+    TenderIQ text extraction module.
+
+    Responsibilities:
+    - Extract text from every PDF page.
+    - Preserve page numbers.
+    - Detect pages that may require OCR.
+    - Provide document-level extraction output.
+    """
 
     @staticmethod
-    def normalize_text(raw_text: str) -> str:
-        if not raw_text:
-            return ""
+    def extract_pages(
+        file_bytes: bytes,
+    ) -> List[Dict[str, Any]]:
+        """Extract text page-by-page."""
 
-        cleaned = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-        cleaned = cleaned.replace(chr(0x00A0), " ")
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        cleaned = re.sub(r"[ \t]+", " ", cleaned)
-        cleaned = re.sub(r"\n ", "\n", cleaned)
-        cleaned = re.sub(r" \n", "\n", cleaned)
-        return cleaned.strip()
+        if not file_bytes:
+            raise ValueError("PDF content is required.")
 
-    @staticmethod
-    def extract_from_bytes(filename: str, file_bytes: bytes) -> Dict[str, Any]:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        pages: List[Dict[str, Any]] = []
+        reader = PdfReader(
+            io.BytesIO(file_bytes)
+        )
 
-        for index, page in enumerate(reader.pages, start=1):
-            page_text = page.extract_text() or ""
-            cleaned_text = PDFTextExtractor.normalize_text(page_text)
+        pages = []
+
+        for page_number, page in enumerate(
+            reader.pages,
+            start=1,
+        ):
+            text = page.extract_text() or ""
+            cleaned_text = text.strip()
+
             pages.append(
                 {
-                    "page_number": index,
+                    "page_number": page_number,
                     "text": cleaned_text,
+                    "character_count": len(cleaned_text),
+                    "needs_ocr": len(cleaned_text) == 0,
                 }
             )
 
+        return pages
+
+    @staticmethod
+    def extract_document_text(
+        file_bytes: bytes,
+    ) -> str:
+        """Return the complete extracted document text."""
+
+        pages = TextExtractor.extract_pages(
+            file_bytes
+        )
+
+        return "\n\n".join(
+            page["text"]
+            for page in pages
+            if page["text"]
+        )
+
+    @staticmethod
+    def process(
+        filename: str,
+        file_bytes: bytes,
+    ) -> Dict[str, Any]:
+        """Process a complete PDF for text extraction."""
+
+        if not filename:
+            raise ValueError("Filename is required.")
+
+        pages = TextExtractor.extract_pages(
+            file_bytes
+        )
+
+        document_text = "\n\n".join(
+            page["text"]
+            for page in pages
+            if page["text"]
+        )
+
+        ocr_required_pages = [
+            page["page_number"]
+            for page in pages
+            if page["needs_ocr"]
+        ]
+
         return {
-            "document_id": "DOC001",
             "filename": filename,
             "page_count": len(pages),
             "pages": pages,
-            "status": "text_extraction_complete",
+            "document_text": document_text,
+            "ocr_required_pages": ocr_required_pages,
+            "status": "text_extracted",
         }

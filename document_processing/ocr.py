@@ -1,77 +1,119 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional
 
-
-class OCRAdapter:
-    """Base OCR adapter interface. Replace this later with Tesseract/Azure OCR."""
-
-    def extract_text(self, image_bytes: bytes, page_number: int) -> Dict[str, Any]:
-        raise NotImplementedError("OCR adapter must implement extract_text().")
-
-
-class SimpleOCRAdapter(OCRAdapter):
-    """Fallback OCR placeholder for scanned PDFs. It is intentionally simple but modular."""
-
-    def extract_text(self, image_bytes: bytes, page_number: int) -> Dict[str, Any]:
-        # In a real project, this would call Tesseract or another OCR provider.
-        # For the prototype, we return a conservative placeholder result.
-        return {
-            "page_number": page_number,
-            "text": "OCR placeholder text: scanned content not yet processed by a provider.",
-            "confidence": 0.60,
-            "status": "ocr_placeholder",
-        }
+import pytesseract
+from PIL import Image
 
 
 class OCRProcessor:
-    """Determines whether OCR is needed and stores page-level OCR results."""
+    """
+    TenderIQ OCR processing module.
 
-    def __init__(self, adapter: Optional[OCRAdapter] = None):
-        self.adapter = adapter or SimpleOCRAdapter()
+    Responsibilities:
+    - Run OCR on PDF page images supplied by the pipeline.
+    - Return extracted text and confidence.
+    - Preserve page-level information.
 
-    @staticmethod
-    def should_use_ocr(page_text: str) -> bool:
-        if not page_text:
-            return True
+    This module does NOT:
+    - Classify documents.
+    - Extract compliance fields.
+    - Make compliance decisions.
+    """
 
-        cleaned = re.sub(r"\s+", " ", page_text).strip()
-        if len(cleaned) < 30:
-            return True
+    TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-        letters = sum(ch.isalpha() for ch in cleaned)
-        if letters == 0:
-            return True
+    def __init__(self, tesseract_path: Optional[str] = None):
+        self.tesseract_path = tesseract_path or self.TESSERACT_PATH
+        pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
 
-        return False
+    def extract_text(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        Run OCR on a single page image.
+        """
 
-    def run_ocr_for_page(self, page_number: int, page_text: str, image_bytes: Optional[bytes] = None) -> Dict[str, Any]:
-        if image_bytes is None:
-            image_bytes = b""
+        text = pytesseract.image_to_string(image)
 
-        if not self.should_use_ocr(page_text):
-            return {
-                "page_number": page_number,
-                "text": page_text,
-                "ocr_used": False,
-                "confidence": 1.0,
-                "status": "direct_text_extraction",
-            }
+        cleaned_text = text.strip()
 
-        result = self.adapter.extract_text(image_bytes, page_number)
-        result["ocr_used"] = True
-        result["page_number"] = page_number
-        return result
+        confidence = self._calculate_confidence(image)
 
-    def run_batch_ocr(self, pages: List[Dict[str, Any]], image_pages: Optional[Dict[int, bytes]] = None) -> List[Dict[str, Any]]:
-        image_pages = image_pages or {}
-        results: List[Dict[str, Any]] = []
+        return {
+            "text": cleaned_text,
+            "confidence": confidence,
+            "character_count": len(cleaned_text),
+            "status": "ocr_completed",
+        }
 
-        for page in pages:
-            page_number = int(page.get("page_number", 1))
-            page_text = str(page.get("text", ""))
-            image_bytes = image_pages.get(page_number, b"")
-            results.append(self.run_ocr_for_page(page_number, page_text, image_bytes))
+    def _calculate_confidence(self, image: Image.Image) -> float:
+        """
+        Calculate average OCR confidence for the page.
+        """
+
+        data = pytesseract.image_to_data(
+            image,
+            output_type=pytesseract.Output.DICT,
+        )
+
+        confidences: List[float] = []
+
+        for value in data["conf"]:
+            try:
+                confidence = float(value)
+
+                if confidence >= 0:
+                    confidences.append(confidence)
+
+            except (ValueError, TypeError):
+                continue
+
+        if not confidences:
+            return 0.0
+
+        return round(sum(confidences) / len(confidences) / 100, 2)
+
+    def process_page(
+        self,
+        image: Image.Image,
+        page_number: int,
+    ) -> Dict[str, Any]:
+        """
+        Process one PDF page through OCR.
+        """
+
+        result = self.extract_text(image)
+
+        return {
+            "page_number": page_number,
+            **result,
+        }
+
+    def process_pages(
+        self,
+        pages: List[Image.Image],
+    ) -> List[Dict[str, Any]]:
+        """
+        Process multiple PDF pages through OCR.
+        """
+
+        results = []
+
+        for page_number, image in enumerate(pages, start=1):
+            results.append(
+                self.process_page(
+                    image=image,
+                    page_number=page_number,
+                )
+            )
 
         return results
+
+
+def ocr_image(image: Image.Image) -> Dict[str, Any]:
+    """
+    Convenience function for OCR processing.
+    """
+
+    processor = OCRProcessor()
+
+    return processor.extract_text(image)

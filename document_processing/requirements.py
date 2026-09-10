@@ -1,88 +1,511 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
-class TenderRequirementExtractor:
-    """Extract common tender eligibility requirements with source evidence."""
+@dataclass
+class TenderRequirement:
+    """
+    One structured requirement extracted from a tender document.
+    """
 
-    @staticmethod
-    def _match_number(text: str, patterns: List[str]) -> Optional[Dict[str, Any]]:
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                value = float(match.group(1).replace(",", ""))
-                unit = (match.group(2) or "").lower()
-                multiplier = {
-                    "lakh": 100000,
-                    "lakhs": 100000,
-                    "crore": 10000000,
-                    "crores": 10000000,
-                    "million": 1000000,
-                }.get(unit, 1)
-                return {
-                    "value": int(value * multiplier),
-                    "currency": "INR",
-                    "evidence_text": match.group(0).strip(),
-                }
-        return None
+    requirement_id: str
+    category: str
+    clause_title: str
+    mandatory: bool
+    requirement_type: str
+    tender_requirement: str
 
-    @staticmethod
-    def extract(text: str, page_number: int = 1) -> Dict[str, Any]:
-        normalized = re.sub(r"[ \t]+", " ", text or "").strip()
-        requirements: Dict[str, Any] = {}
+    minimum_value: Optional[float] = None
+    maximum_value: Optional[float] = None
+    required_value: Optional[Any] = None
+    unit: Optional[str] = None
 
-        experience = re.search(
-            r"(?:at least|min(?:imum)?|minimum of)\s+(\d+)\s+(?:years?|year)\s+(?:of\s+)?(?:similar\s+)?experience",
-            normalized,
-            re.IGNORECASE,
-        )
-        if experience:
-            requirements["minimum_experience_years"] = {
-                "value": int(experience.group(1)),
-                "page": page_number,
-                "evidence_text": experience.group(0),
-                "confidence": 0.9,
-            }
+    parameters: Dict[str, Any] = field(
+        default_factory=dict
+    )
 
-        turnover = TenderRequirementExtractor._match_number(
-            normalized,
-            [
-                r"(?:average|min(?:imum)?|annual)\s+turnover.{0,30}?(?:₹|Rs\.?|INR)\s*([0-9,.]+)\s*(crores?|lakhs?|million)?",
-                r"(?:₹|Rs\.?|INR)\s*([0-9,.]+)\s*(crores?|lakhs?|million)?[^.]{0,30}turnover",
-            ],
-        )
-        if turnover:
-            turnover.update({"page": page_number, "confidence": 0.85})
-            requirements["minimum_annual_turnover"] = turnover
-
-        bid_security = TenderRequirementExtractor._match_number(
-            normalized,
-            [
-                r"(?:EMD|earnest money deposit|bid security)[^.]{0,60}(?:₹|Rs\.?|INR)\s*([0-9,.]+)\s*(lakhs?|crores?|million)?",
-                r"(?:₹|Rs\.?|INR)\s*([0-9,.]+)\s*(lakhs?|crores?|million)?[^.]{0,30}(?:EMD|bid security)",
-            ],
-        )
-        if bid_security:
-            bid_security.update({"page": page_number, "confidence": 0.9})
-            requirements["bid_security"] = bid_security
-
-        project_count = re.search(
-            r"(?:at least|min(?:imum)?|minimum of)\s+(\d+)\s+(?:similar\s+)?(?:projects?|works?|contracts?)",
-            normalized,
-            re.IGNORECASE,
-        )
-        if project_count:
-            requirements["minimum_similar_projects"] = {
-                "value": int(project_count.group(1)),
-                "page": page_number,
-                "evidence_text": project_count.group(0),
-                "confidence": 0.82,
-            }
-
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "requirement_count": len(requirements),
-            "requirements": requirements,
-            "status": "tender_requirements_extracted",
+            "id": self.requirement_id,
+            "category": self.category,
+            "clauseTitle": self.clause_title,
+            "mandatory": self.mandatory,
+            "requirement_type": self.requirement_type,
+            "tenderRequirement": self.tender_requirement,
+            "minimum_value": self.minimum_value,
+            "maximum_value": self.maximum_value,
+            "required_value": self.required_value,
+            "unit": self.unit,
+            "parameters": self.parameters,
         }
+
+
+class TenderRequirementExtractor:
+    """
+    TenderIQ tender requirement extractor.
+
+    Extracts common procurement requirements from tender text.
+
+    Supported requirement types include:
+    - Turnover
+    - Technical experience
+    - Similar project value
+    - Local content / Make in India
+    - Bid security / EMD
+    - GST
+    - PAN
+    - OEM authorization
+    - Blacklisting / debarment
+    - GFR 144(xi)
+    - Certifications
+
+    This module extracts requirements only.
+    It does NOT evaluate bidder compliance.
+    """
+
+    CATEGORY_MAP = {
+        "turnover": "Financial Capability & Turnover",
+        "annual_turnover": "Financial Capability & Turnover",
+        "average_turnover": "Financial Capability & Turnover",
+
+        "technical_experience": "Technical Experience",
+        "similar_project": "Technical Experience",
+        "project_value": "Technical Experience",
+
+        "gst": "Statutory & Tax Compliance",
+        "pan": "Statutory & Tax Compliance",
+
+        "make_in_india": "Make in India (MII) & GFR Rule 144(xi)",
+        "local_content": "Make in India (MII) & GFR Rule 144(xi)",
+        "gfr_144_xi": "Make in India (MII) & GFR Rule 144(xi)",
+
+        "bid_security": "Financial Capability & Turnover",
+
+        "oem_authorization": "Technical Experience",
+
+        "blacklisting": "Statutory & Tax Compliance",
+        "debarment": "Statutory & Tax Compliance",
+
+        "certification": "Quality & Safety Certifications",
+    }
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """Normalize tender text."""
+
+        if not text:
+            return ""
+
+        text = text.replace("\n", " ")
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+    @staticmethod
+    def _convert_amount(
+        value: str,
+        unit: Optional[str],
+    ) -> float:
+        """Convert an amount into INR."""
+
+        number = float(
+            value.replace(",", "")
+        )
+
+        if not unit:
+            return number
+
+        unit = unit.lower()
+
+        if unit in {"crore", "crores", "cr"}:
+            return number * 10_000_000
+
+        if unit in {"lakh", "lakhs"}:
+            return number * 100_000
+
+        if unit in {"million", "mn"}:
+            return number * 1_000_000
+
+        return number
+
+    @staticmethod
+    def _is_mandatory(text: str) -> bool:
+        """Determine whether a clause appears mandatory."""
+
+        mandatory_words = [
+            "shall",
+            "must",
+            "mandatory",
+            "required",
+            "eligibility criteria",
+            "minimum requirement",
+            "bidder should",
+            "bidder shall",
+        ]
+
+        text_lower = text.lower()
+
+        return any(
+            word in text_lower
+            for word in mandatory_words
+        )
+
+    def _extract_turnover(
+        self,
+        text: str,
+        requirement_id: str,
+    ) -> Optional[TenderRequirement]:
+        """
+        Extract minimum annual/average turnover.
+        """
+
+        pattern = (
+            r"(?:minimum\s+)?"
+            r"(?:average\s+annual|annual)"
+            r"\s+turnover"
+            r".{0,80}?"
+            r"(?:₹|rs\.?|inr)?\s*"
+            r"([\d,]+(?:\.\d+)?)\s*"
+            r"(crore|crores|cr|lakh|lakhs|million|mn)"
+        )
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return None
+
+        value = self._convert_amount(
+            match.group(1),
+            match.group(2),
+        )
+
+        return TenderRequirement(
+            requirement_id=requirement_id,
+            category=self.CATEGORY_MAP["turnover"],
+            clause_title="Financial Capability & Turnover",
+            mandatory=self._is_mandatory(text),
+            requirement_type="turnover",
+            tender_requirement=text,
+            minimum_value=value,
+            unit="INR",
+        )
+
+    def _extract_project_value(
+        self,
+        text: str,
+        requirement_id: str,
+    ) -> Optional[TenderRequirement]:
+        """
+        Extract minimum similar-project value.
+        """
+
+        pattern = (
+            r"(?:similar|similar\s+project|"
+            r"similar\s+work|experience)"
+            r".{0,150}?"
+            r"(?:value|worth|valued\s+at)"
+            r".{0,40}?"
+            r"(?:₹|rs\.?|inr)?\s*"
+            r"([\d,]+(?:\.\d+)?)\s*"
+            r"(crore|crores|cr|lakh|lakhs|million|mn)"
+        )
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return None
+
+        value = self._convert_amount(
+            match.group(1),
+            match.group(2),
+        )
+
+        return TenderRequirement(
+            requirement_id=requirement_id,
+            category=self.CATEGORY_MAP["project_value"],
+            clause_title="Technical Experience",
+            mandatory=self._is_mandatory(text),
+            requirement_type="similar_project",
+            tender_requirement=text,
+            minimum_value=value,
+            unit="INR",
+        )
+
+    def _extract_local_content(
+        self,
+        text: str,
+        requirement_id: str,
+    ) -> Optional[TenderRequirement]:
+        """
+        Extract minimum local-content percentage.
+        """
+
+        pattern = (
+            r"(?:minimum\s+)?"
+            r"(?:local\s+content|local\s+value\s+addition)"
+            r".{0,50}?"
+            r"(\d+(?:\.\d+)?)\s*%"
+        )
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return None
+
+        value = float(
+            match.group(1)
+        )
+
+        return TenderRequirement(
+            requirement_id=requirement_id,
+            category=self.CATEGORY_MAP["local_content"],
+            clause_title="Make in India / Local Content",
+            mandatory=self._is_mandatory(text),
+            requirement_type="local_content",
+            tender_requirement=text,
+            minimum_value=value,
+            unit="percentage",
+        )
+
+    def _extract_bid_security(
+        self,
+        text: str,
+        requirement_id: str,
+    ) -> Optional[TenderRequirement]:
+        """
+        Extract bid security / EMD amount.
+        """
+
+        pattern = (
+            r"(?:bid\s+security|"
+            r"earnest\s+money\s+deposit|"
+            r"EMD)"
+            r".{0,80}?"
+            r"(?:₹|rs\.?|inr)?\s*"
+            r"([\d,]+(?:\.\d+)?)\s*"
+            r"(crore|crores|cr|lakh|lakhs|million|mn)?"
+        )
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return None
+
+        value = self._convert_amount(
+            match.group(1),
+            match.group(2),
+        )
+
+        return TenderRequirement(
+            requirement_id=requirement_id,
+            category=self.CATEGORY_MAP["bid_security"],
+            clause_title="Bid Security / EMD",
+            mandatory=self._is_mandatory(text),
+            requirement_type="bid_security",
+            tender_requirement=text,
+            minimum_value=value,
+            unit="INR",
+        )
+
+    def _detect_boolean_requirement(
+        self,
+        text: str,
+        requirement_id: str,
+        requirement_type: str,
+        category: str,
+        clause_title: str,
+        keywords: List[str],
+    ) -> Optional[TenderRequirement]:
+        """
+        Detect requirements where compliance depends on
+        presence of a declaration/document.
+        """
+
+        text_lower = text.lower()
+
+        matched = any(
+            keyword.lower() in text_lower
+            for keyword in keywords
+        )
+
+        if not matched:
+            return None
+
+        return TenderRequirement(
+            requirement_id=requirement_id,
+            category=category,
+            clause_title=clause_title,
+            mandatory=self._is_mandatory(text),
+            requirement_type=requirement_type,
+            tender_requirement=text,
+            required_value=True,
+        )
+
+    def extract_requirements(
+        self,
+        text: str,
+    ) -> List[TenderRequirement]:
+        """
+        Extract all recognizable requirements from tender text.
+        """
+
+        normalized_text = self.normalize_text(text)
+
+        if not normalized_text:
+            return []
+
+        requirements: List[TenderRequirement] = []
+
+        counter = 1
+
+        turnover = self._extract_turnover(
+            normalized_text,
+            f"REQ-{counter:03d}",
+        )
+
+        if turnover:
+            requirements.append(turnover)
+            counter += 1
+
+        project_value = self._extract_project_value(
+            normalized_text,
+            f"REQ-{counter:03d}",
+        )
+
+        if project_value:
+            requirements.append(project_value)
+            counter += 1
+
+        local_content = self._extract_local_content(
+            normalized_text,
+            f"REQ-{counter:03d}",
+        )
+
+        if local_content:
+            requirements.append(local_content)
+            counter += 1
+
+        bid_security = self._extract_bid_security(
+            normalized_text,
+            f"REQ-{counter:03d}",
+        )
+
+        if bid_security:
+            requirements.append(bid_security)
+            counter += 1
+
+        boolean_requirements = [
+            (
+                "gst",
+                "Statutory & Tax Compliance",
+                "Valid GST Registration",
+                ["gst", "gstin", "gst registration"],
+            ),
+            (
+                "pan",
+                "Statutory & Tax Compliance",
+                "Valid PAN",
+                ["pan", "permanent account number"],
+            ),
+            (
+                "oem_authorization",
+                "Technical Experience",
+                "OEM Authorization",
+                [
+                    "oem authorization",
+                    "manufacturer authorization",
+                    "authorized manufacturer",
+                ],
+            ),
+            (
+                "blacklisting",
+                "Statutory & Tax Compliance",
+                "Non-Blacklisting / Debarment Declaration",
+                [
+                    "not blacklisted",
+                    "not debarred",
+                    "blacklisting",
+                    "debarment",
+                ],
+            ),
+            (
+                "gfr_144_xi",
+                "Make in India (MII) & GFR Rule 144(xi)",
+                "GFR Rule 144(xi) Declaration",
+                [
+                    "gfr 144",
+                    "rule 144",
+                    "land border",
+                ],
+            ),
+        ]
+
+        for (
+            requirement_type,
+            category,
+            clause_title,
+            keywords,
+        ) in boolean_requirements:
+
+            requirement = self._detect_boolean_requirement(
+                normalized_text,
+                f"REQ-{counter:03d}",
+                requirement_type,
+                category,
+                clause_title,
+                keywords,
+            )
+
+            if requirement:
+                requirements.append(requirement)
+                counter += 1
+
+        return requirements
+
+    def to_dict_list(
+        self,
+        requirements: List[TenderRequirement],
+    ) -> List[Dict[str, Any]]:
+        """Convert requirements into dictionaries."""
+
+        return [
+            requirement.to_dict()
+            for requirement in requirements
+        ]
+
+
+def extract_requirements(
+    text: str,
+) -> List[Dict[str, Any]]:
+    """
+    Convenience function for tender requirement extraction.
+    """
+
+    extractor = TenderRequirementExtractor()
+
+    requirements = extractor.extract_requirements(
+        text
+    )
+
+    return extractor.to_dict_list(
+        requirements
+    )
